@@ -13,97 +13,178 @@
 #include <errno.h>
 #include <stropts.h>
 #include <asm/ioctls.h>
+#include <sys/timerfd.h>
+#include <setjmp.h>
+#include <execinfo.h>
 
 #include "termios_conv.h"
 
 
 /*****************************************************************************/
-/*** Macros								   ***/
+/*** Macros                                                                ***/
 /*****************************************************************************/
-#define INTDIV(n, d)		(2*(n)+(d))/(2*(d))
+#define INTDIV(n, d)            ((n) + ((((n) >= 0 && (d) >= 0) || ((n) < 0 && (d) <0 )) ? ((d) / 2) : -((d) / 2))) / (d)
+
+/* Macro to calculate the number of members in an array */
+#define ARRAY_SIZE(arr)         (sizeof(arr) / sizeof((arr)[0]))
 
 
 /*****************************************************************************/
-/*** Globals								   ***/
+/*** Globals                                                               ***/
 /*****************************************************************************/
 /* Command line options */
-static speed_t		bitRate		= 115200;
-static char		ttyPort[32]	= "/dev/ttyUSB0";
-static int		BeVerbose	= 0;
-static int		Receiver	= 0;
-static int		Transmitter	= 0;
-static int		FlowControl	= 0;
-static int		Restart		= 0;
+static speed_t               bit_rate     = 115200;
+static char                  tty_name[32] = "/dev/ttyUSB0";
+static int                   verbosity    = 0;
+static int                   rx_enabled   = 0;
+static int                   tx_enabled   = 0;
+static int                   flow_control = 0;
+static int                   restart      = 0;
 
-static int		file		= 0;
-struct serial_struct	oldserinfo;
-static struct termios	oldtio;
-static unsigned char	pattern[256];
+static int                   ttyfd        = 0;
+static struct serial_struct  oldserinfo;
+static struct termios        oldtio;
+static unsigned char         tty_set      = 0;
+
+static unsigned char         pattern[256];
+
+/* Back-trace data */
+static void                  *bt_trace[20]; /* Back-trace buffer */
+static size_t                bt_count;      /* Back-trace count */
+static jmp_buf               bt_env;        /* Back-trace environment */
 
 
 /*****************************************************************************/
-/*** Static functions							   ***/
+/*** Static functions                                                      ***/
 /*****************************************************************************/
-static int init(char const * const serport)
+static void transmit(unsigned long long *tx_bytes)
 {
-	int			oflag;
-	int			standard_bitrate;
-	int			c;
-	struct termios		newtio;
+	static unsigned char  index = 0;
+	ssize_t               bytes;
 
-	if (file)
-		return -1;
+	if ((bytes = write(ttyfd, &pattern[index], sizeof(pattern) - index)) < 0) {
+		perror("Writing data");
+		return ;
+	}
+/*
+	if (verbosity && *tx_bytes) {
+		unsigned int count;
+		fprintf(stdout, "Transmitted %d bytes:", *tx_bytes);
+		for (count=0; count < *tx_bytes; count++)
+			fprintf(stdout, " 0x%.2X", pattern[index + count]);
+		fprintf(stdout, "\n");
+	}
+*/
+	index     += bytes;
+	*tx_bytes += bytes;
+}
 
-	if (BeVerbose)
-		printf("Opening %s\n", serport);
 
-	/* Open the serial port */
-	if (Receiver && Transmitter)
-		oflag = O_RDWR;
-	else if (Transmitter)
-		oflag = O_WRONLY;
-	else
-		oflag = O_RDONLY;
-	file = open(serport, oflag | O_NOCTTY );
-	if (file < 0) {
-		perror(serport);
-		return -errno;
+static void receive(unsigned long long *rx_bytes)
+{
+	static unsigned int   state        = 0;
+	static unsigned char  read_byte[3] = {-1, -1, -1};
+	ssize_t               bytes;
+
+	while ((bytes = read(ttyfd, &read_byte[0], 1)) > 0) {
+		*rx_bytes += bytes;
+		if (verbosity) {
+			if (*rx_bytes == 1)
+				fprintf(stdout, "Receiving\n");
+		}
+
+		if (verbosity > 1)
+			fprintf(stdout, "Rx: 0x%.2X\n", read_byte[0]);
+
+		switch (state) {
+		case 0:
+			if (*rx_bytes < sizeof(read_byte))
+				break;
+			if (verbosity)
+				fprintf(stdout, "Verifying\n");
+			state ++;
+		case 1:
+			if (read_byte[0] != (unsigned char)(read_byte[1] + 1)) {
+				fprintf(stderr, "Sync error: read 0x%.2X, expected 0x%.2X\n", read_byte[0], (unsigned char)(read_byte[1] + 1));
+				state ++;
+			}
+			break;
+		case 2:
+			if (read_byte[0] == (unsigned char)(read_byte[2] + 1)) {
+				fprintf(stderr, "Resync: Error was caused by inserted 0x%.2X\n", read_byte[1]);
+				state --;
+			} else if (read_byte[0] == (unsigned char)(read_byte[2] + 2)) {
+				fprintf(stderr, "Resync: Error was caused by corrupted 0x%.2X\n", read_byte[1]);
+				state --;
+			} else if ((read_byte[0] == (unsigned char)(read_byte[1] + 1)) &&
+			           (read_byte[0] == (unsigned char)(read_byte[2] + 3)) ) {
+				fprintf(stderr, "Resync: Error was caused by missing 0x%.2X\n", (unsigned char)(read_byte[1] - 1));
+				state --;
+			} else {
+				fprintf(stderr, "Unable to resync\n");
+				fprintf(stderr, "	Read:       0x%.2X\n", read_byte[0]);
+				fprintf(stderr, "	Read (t-1): 0x%.2X\n", read_byte[1]);
+				fprintf(stderr, "	Read (t-2): 0x%.2X\n", read_byte[2]);
+				if (restart) {
+					fprintf(stderr, "Restarting\n");
+					state = 0;
+					*rx_bytes = 0;
+				} else {
+					fprintf(stderr, "Exiting\n");
+					exit(0);
+				}
+			}
+			break;
+		}
+		read_byte[2] = read_byte[1];
+		read_byte[1] = read_byte[0];
 	}
 
+	if (bytes < 0)
+		perror("Reading data");
+}
+
+
+static void set_tty(void)
+{
+	int             standard_bitrate;
+	int             c;
+	struct termios  newtio;
+
 	/* Store current serial configuration */
-	if (ioctl(file, TIOCGSERIAL, &oldserinfo) < 0)
+	if (ioctl(ttyfd, TIOCGSERIAL, &oldserinfo) < 0)
 		perror("TIOCGSERIAL");
 
 	/* Check if we need to set a custom bit rate */
-	if (!(standard_bitrate = termios_bitrate(bitRate))) {
-		struct serial_struct	newserinfo;
+	if (!(standard_bitrate = termios_bitrate(bit_rate))) {
+		struct serial_struct  newserinfo;
 
 		/* Set custom bit rate */
-		if (ioctl(file, TIOCGSERIAL, &newserinfo) < 0)
+		if (ioctl(ttyfd, TIOCGSERIAL, &newserinfo) < 0)
 			perror("TIOCGSERIAL");
 		newserinfo.flags = (newserinfo.flags & ~ASYNC_SPD_MASK) | ASYNC_SPD_CUST;
-		if ((newserinfo.custom_divisor = INTDIV(newserinfo.baud_base, bitRate)) < 1)
+		if ((newserinfo.custom_divisor = INTDIV(newserinfo.baud_base, bit_rate)) < 1)
 			newserinfo.custom_divisor = 1;
-		if (ioctl(file, TIOCSSERIAL, &newserinfo) < 0)
+		if (ioctl(ttyfd, TIOCSSERIAL, &newserinfo) < 0)
 			perror("TIOCSSERIAL");
 
 		/* Verify custom bit rate */
-		if (ioctl(file, TIOCGSERIAL, &newserinfo) < 0)
+		if (ioctl(ttyfd, TIOCGSERIAL, &newserinfo) < 0)
 			perror("TIOCGSERIAL");
-		if (newserinfo.custom_divisor * bitRate != newserinfo.baud_base)
-			printf("Actual bit rate is %d / %d = %f\n", newserinfo.baud_base,
-			       newserinfo.custom_divisor, (float)newserinfo.baud_base / newserinfo.custom_divisor);
+		if (newserinfo.custom_divisor * bit_rate != newserinfo.baud_base)
+			fprintf(stdout, "Actual bit rate is %d / %d = %f\n", newserinfo.baud_base,
+			        newserinfo.custom_divisor, (float)newserinfo.baud_base / newserinfo.custom_divisor);
 
 		/* Set standard bit rate to custom bit rate marking value */
 		standard_bitrate = B38400;
 	}
 
 	/* Save the current serial port settings */
-	tcgetattr(file, &oldtio);
+	tcgetattr(ttyfd, &oldtio);
 
 	/* Fill out the new serial port settings */
 	bzero(&newtio, sizeof(newtio));
-	newtio.c_cflag = standard_bitrate | CS8 | CLOCAL | CREAD | (FlowControl?CRTSCTS:0);
+	newtio.c_cflag = standard_bitrate | CS8 | CLOCAL | CREAD | (flow_control ? CRTSCTS : 0);
 	newtio.c_iflag = IGNPAR;
 	newtio.c_oflag = 0;
 	newtio.c_lflag = 0; /* Input mode (non-canonical, no echo,...) */
@@ -111,10 +192,10 @@ static int init(char const * const serport)
 	newtio.c_cc[VMIN]  = 0;   /* No blocking read */
 
 	/* Flush the buffer */
-	tcflush (file, TCIFLUSH);
+	tcflush(ttyfd, TCIFLUSH);
 
 	/* Set the new attributes */
-	tcsetattr (file, TCSANOW, &newtio);
+	tcsetattr (ttyfd, TCSANOW, &newtio);
 
 	/* Initialize the pattern buffer */
 	for (c = 0; c < 256; c++) {
@@ -139,164 +220,115 @@ static int init(char const * const serport)
 		pattern[c] = (unsigned char)c;
 #endif
 	}
-
-	return 0;
 }
 
 
-static void term(void)
+static void restore_tty(void)
 {
 	/* Restore the old attributes */
-	tcsetattr(file,TCSANOW,&oldtio);
+	tcsetattr(ttyfd, TCSANOW, &oldtio);
 
 	/* Restore the old serial configuration */
-	ioctl(file, TIOCSSERIAL, &oldserinfo);
+	ioctl(ttyfd, TIOCSSERIAL, &oldserinfo);
 
 	/* Flush the buffer */
-	tcflush (file, TCIFLUSH);
-
-	/* Close the serial port */
-	close (file);
-
-	file = 0;
-
-	return;
+	tcflush(ttyfd, TCIFLUSH);
 }
 
 
-static void transmit(void)
-{
-	static unsigned char	index = 0;
-	unsigned int		txed;
-
-	txed = write(file, &pattern[index], sizeof(pattern) - index);
 /*
-	if (BeVerbose && txed) {
-		unsigned int count;
-		printf("Transmitted %d bytes:", txed);
-		for (count=0; count < txed; count++)
-			printf(" 0x%.2X", pattern[index + count]);
-		printf("\n");
-	}
-*/
-	index += txed;
-}
-
-
-static void receive(void)
+ * This function installed as a signal handler, and is called automatically
+ * whenever a SIGINT, SIGQUIT, SIGTERM or SIGSEGV is received. Its purpose is
+ * to exit normally, enabling the terminator to shut down all subsystems.
+ * Handling of SIGABRT and SIGSEGV are special cases. Because a back-trace is
+ * desirable but printing is not recommended within a signal handler, the back-
+ * trace is stored and a long jump to main is made, so it can be printed in
+ * main context.
+ */
+static void signal_handler(int signum)
 {
-	static unsigned int		state		= 0;
-	static unsigned char		read_byte[3]	= {-1, -1, -1};
-	static unsigned long long	received	= 0;
+	switch (signum) {
+	case SIGINT:
+	case SIGQUIT:
+	case SIGTERM:
+		/* Exit gracefully */
+		if (tty_set)
+			restore_tty();
+		exit(signum);
+		break;
 
-	while (read(file, &read_byte[0], 1)) {
-		received++;
-		if (BeVerbose) {
-			if (received == 1)
-				printf("Receiving\n");
-			else if (!(received & 0x3FFF))
-				printf("%lld bytes\n", received);
-		}
+	case SIGABRT:
+	case SIGSEGV:
+		/* Save the trace in statics */
+		bt_count = backtrace(bt_trace, ARRAY_SIZE(bt_trace));
 
-		if (BeVerbose > 1)
-			printf("Rx: 0x%.2X\n", read_byte[0]);
-
-		switch (state) {
-		case 0:
-			if (received < sizeof(read_byte))
-				break;
-			if (BeVerbose)
-				printf("Verifying\n");
-			state ++;
-		case 1:
-			if (read_byte[0] != (unsigned char)(read_byte[1] + 1)) {
-				printf("Sync error: read 0x%.2X, expected 0x%.2X\n", read_byte[0], (unsigned char)(read_byte[1] + 1));
-				state ++;
-			}
-			break;
-		case 2:
-			if (read_byte[0] == (unsigned char)(read_byte[2] + 1)) {
-				printf("Resync: Error was caused by inserted 0x%.2X\n", read_byte[1]);
-				state --;
-			} else
-			if (read_byte[0] == (unsigned char)(read_byte[2] + 2)) {
-				printf("Resync: Error was caused by corrupted 0x%.2X\n", read_byte[1]);
-				state --;
-			} else
-			if ((read_byte[0] == (unsigned char)(read_byte[1] + 1)) &&
-			    (read_byte[0] == (unsigned char)(read_byte[2] + 3)) ) {
-				printf("Resync: Error was caused by missing 0x%.2X\n", (unsigned char)(read_byte[1] - 1));
-				state --;
-			} else {
-				printf("Unable to resync\n");
-				printf("	Read:       0x%.2X\n", read_byte[0]);
-				printf("	Read (t-1): 0x%.2X\n", read_byte[1]);
-				printf("	Read (t-2): 0x%.2X\n", read_byte[2]);
-				if (Restart) {
-					printf("Restarting\n");
-					state = 0;
-					received = 0;
-				} else {
-					printf("Exiting\n");
-					exit(0);
-				}
-			}
-			break;
-		}
-		read_byte[2] = read_byte[1];
-		read_byte[1] = read_byte[0];
+		/* Jump to main context */
+		longjmp(bt_env, signum);
 	}
-}
-
-
-static void signal_callback_handler(int signum)
-{
-	printf("Caught signal %d\n",signum);
-
-	term();
-
-	exit(signum);
 }
 
 
 /*****************************************************************************/
-/*** Functions								   ***/
+/*** Function                                                              ***/
 /*****************************************************************************/
 int main(int argc, char* argv[])
 {
-	int		arg;
-	int		result = 0;
-	struct pollfd	fds[1];
+	int                 result = 0;
+	int                 signum;
+	int                 arg;
+	int                 oflag;
+	struct pollfd       fds[2];
+	int                 timerfd;
+	struct itimerspec   timeout;
+	unsigned long long  tx_bytes = 0;
+	unsigned long long  rx_bytes = 0;
 
-	signal(SIGINT, signal_callback_handler);
+	/* Install signal handler */
+	signal(SIGABRT, signal_handler);
+	signal(SIGINT,  signal_handler);
+	signal(SIGQUIT, signal_handler);
+	signal(SIGTERM, signal_handler);
+	signal(SIGSEGV, signal_handler);
+	signal(SIGPIPE, SIG_IGN); /* Ignore SIGPIPE */
+
+	/* Create an environment copy to allow jumping here from signal handler, decoupling calls to syslog, sync et all */
+	if ((signum = setjmp(bt_env)) != 0) {
+		char    **strings = backtrace_symbols(bt_trace, bt_count);
+		size_t  bt_ndx;
+
+		fprintf(stderr, "Caught signal %d\n", signum);
+		for (bt_ndx = 0; bt_ndx < bt_count; bt_ndx++)
+			fprintf(stderr, "Back-trace: %s\n", strings[bt_ndx]);
+		exit(EXIT_FAILURE);
+	}
 
 	/* Process the command line arguments */
 	while ((arg = getopt(argc, argv, "b:fp:rtvh")) != -1) {
 		switch (arg) {
 		case 'b':
 			/* Retrieve bit rate */
-			bitRate = strtol(optarg, NULL, 0);
+			bit_rate = strtol(optarg, NULL, 0);
 			break;
 		case 'f':
 			/* Enable flow control */
-			FlowControl = 1;
+			flow_control = 1;
 			break;
 		case 'p':
 			/* Retrieve port */
-			strncpy (ttyPort, optarg, sizeof(ttyPort));
-			ttyPort[sizeof(ttyPort)-1] = 0;
+			strncpy(tty_name, optarg, sizeof(tty_name));
+			tty_name[sizeof(tty_name)-1] = 0;
 			break;
 		case 'r':
 			/* Enable receiver */
-			Receiver = 1;
+			rx_enabled = 1;
 			break;
 		case 't':
 			/* Enable transmitter */
-			Transmitter = 1;
+			tx_enabled = 1;
 			break;
 		case 'v':
 			/* Be verbose */
-			BeVerbose ++;
+			verbosity++;
 			break;
 		default:
 			result = -1;
@@ -317,34 +349,94 @@ int main(int argc, char* argv[])
 
 	if (argc) {
 		fprintf(stderr, "Stdin not supported\n");
-		exit(-1);
+		result = EXIT_FAILURE;
+		goto err_arg;
 	}
 
-	if (init(ttyPort) < 0)
-		exit(-1);
+	if (verbosity)
+		fprintf(stdout, "Opening %s\n", tty_name);
 
-	memset(&fds[0], 0, sizeof(fds[0]));
-	fds[0].fd = file;
-	if (Receiver)
+	/* Open the serial port */
+	if (rx_enabled && tx_enabled)
+		oflag = O_RDWR;
+	else if (tx_enabled)
+		oflag = O_WRONLY;
+	else
+		oflag = O_RDONLY;
+
+	if ((ttyfd = open(tty_name, oflag | O_NOCTTY)) < 0) {
+		perror(tty_name);
+		result = EXIT_FAILURE;
+		goto err_ttyfd;
+	}
+
+	set_tty();
+	tty_set = 1;
+
+	/* Create a new timer to report periodically */
+	if ((timerfd = timerfd_create(CLOCK_MONOTONIC, 0)) < 0) {
+		perror("Creating report timer");
+		result = EXIT_FAILURE;
+		goto err_timer;
+	}
+
+	/* Set the timeout timer */
+	memset(&timeout, 0, sizeof(timeout));
+	timeout.it_value.tv_sec  = 1;
+	timeout.it_value.tv_nsec = 0;
+	if (timerfd_settime(timerfd, 0, &timeout, NULL) < 0) {
+		perror("Setting report timeout");
+		result = EXIT_FAILURE;
+		goto err_timer_set;
+	}
+
+	memset(fds, 0, sizeof(fds));
+	fds[0].fd = ttyfd;
+	if (rx_enabled)
 		fds[0].events |= POLLIN;
-	if (Transmitter)
+	if (tx_enabled)
 		fds[0].events |= POLLOUT;
+	fds[1].fd     = timerfd;
+	fds[1].events = POLLIN;
 
-	while (Transmitter || Receiver) {
-		if (poll(fds, 1, -1) < 0) {
+	while (tx_enabled || rx_enabled) {
+		if (poll(fds, ARRAY_SIZE(fds), -1) < 0) {
 			perror("Polling serial port");
 			result = -errno;
 			break;
 		}
 
 		if (fds[0].revents & POLLOUT)
-			transmit();
+			transmit(&tx_bytes);
 
 		if (fds[0].revents & POLLIN)
-			receive();
+			receive(&rx_bytes);
+
+		/* Check if the report timeout time has expired */
+		if (fds[1].revents & POLLIN) {
+			static unsigned long long  tx_rate = 0;
+			static unsigned long long  rx_rate = 0;
+
+			/* Reload the timer */
+			timeout.it_value.tv_sec  = 1;
+			timeout.it_value.tv_nsec = 0;
+			timerfd_settime(timerfd, 0, &timeout, NULL);
+
+			fprintf(stdout, "Tx: %lld bytes (%lld kB/s), Rx: %lld bytes (%lld kB/s)\n",
+			        tx_bytes, INTDIV(tx_bytes - tx_rate, 1024),
+			        rx_bytes, INTDIV(rx_bytes - rx_rate, 1024));
+			tx_rate = tx_bytes;
+			rx_rate = rx_bytes;
+		}
 	}
 
-	term();
-
+err_timer_set:
+	close(timerfd);
+err_timer:
+	restore_tty();
+	/* Close the serial port */
+	close(ttyfd);
+err_ttyfd:
+err_arg:
 	return result;
 }
