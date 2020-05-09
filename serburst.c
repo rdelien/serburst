@@ -10,7 +10,6 @@
 #include <time.h>
 #include <linux/serial.h>
 #include <poll.h>
-#include <errno.h>
 #include <stropts.h>
 #include <asm/ioctls.h>
 #include <sys/timerfd.h>
@@ -380,10 +379,10 @@ int main(int argc, char* argv[])
 		goto err_timer;
 	}
 
-	/* Set the timeout timer */
+	/* Make timer periodic */
 	memset(&timeout, 0, sizeof(timeout));
-	timeout.it_value.tv_sec  = 1;
-	timeout.it_value.tv_nsec = 0;
+	timeout.it_value.tv_sec    = 1; /* Fire after 1 second */
+	timeout.it_interval.tv_sec = 1; /* Repeat every second */
 	if (timerfd_settime(timerfd, 0, &timeout, NULL) < 0) {
 		perror("Setting report timeout");
 		result = EXIT_FAILURE;
@@ -402,7 +401,7 @@ int main(int argc, char* argv[])
 	while (tx_enabled || rx_enabled) {
 		if (poll(fds, ARRAY_SIZE(fds), -1) < 0) {
 			perror("Polling serial port");
-			result = -errno;
+			result = EXIT_FAILURE;
 			break;
 		}
 
@@ -416,11 +415,13 @@ int main(int argc, char* argv[])
 		if (fds[1].revents & POLLIN) {
 			static unsigned long long  tx_rate = 0;
 			static unsigned long long  rx_rate = 0;
+			unsigned long long         missed;
 
-			/* Reload the timer */
-			timeout.it_value.tv_sec  = 1;
-			timeout.it_value.tv_nsec = 0;
-			timerfd_settime(timerfd, 0, &timeout, NULL);
+			if (read(fds[1].fd, &missed, sizeof(missed)) < 0) {
+				perror("Error reading timer");
+				result = EXIT_FAILURE;
+				break;
+			}
 
 			fprintf(stdout, "Tx: %lld bytes (%lld kB/s), Rx: %lld bytes (%lld kB/s)\n",
 			        tx_bytes, INTDIV(tx_bytes - tx_rate, 1024),
