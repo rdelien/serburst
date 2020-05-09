@@ -147,7 +147,6 @@ static void receive(unsigned long long *rx_bytes)
 static void set_tty(void)
 {
 	int             standard_bitrate;
-	int             c;
 	struct termios  newtio;
 
 	/* Store current serial configuration */
@@ -195,30 +194,6 @@ static void set_tty(void)
 
 	/* Set the new attributes */
 	tcsetattr (ttyfd, TCSANOW, &newtio);
-
-	/* Initialize the pattern buffer */
-	for (c = 0; c < 256; c++) {
-#if defined TEST_CORRUPTED
-		if (c == 0x51)
-			pattern[c] = ~(unsigned char)c;
-		else
-			pattern[c] = (unsigned char)c;
-#elif defined TEST_MISSING
-		if (c >= 0x51)
-			pattern[c] = (unsigned char)c + 1;
-		else
-			pattern[c] = (unsigned char)c;
-#elif defined TEST_INSERTED
-		if (c == 0x51)
-			pattern[c] = ~(unsigned char)c;
-		else if (c >= 0x51)
-			pattern[c] = (unsigned char)c - 1;
-		else
-			pattern[c] = (unsigned char)c;
-#else
-		pattern[c] = (unsigned char)c;
-#endif
-	}
 }
 
 
@@ -275,6 +250,7 @@ int main(int argc, char* argv[])
 	int                 result = 0;
 	int                 signum;
 	int                 arg;
+	int                 ndx;
 	int                 oflag;
 	struct pollfd       fds[2];
 	int                 timerfd;
@@ -367,6 +343,30 @@ int main(int argc, char* argv[])
 		perror(tty_name);
 		result = EXIT_FAILURE;
 		goto err_ttyfd;
+	}
+
+	/* Initialize the pattern buffer */
+	for (ndx = 0; ndx < 256; ndx++) {
+#if defined TEST_CORRUPTED
+		if (ndx == 0x51)
+			pattern[ndx] = ~(unsigned char)ndx;
+		else
+			pattern[ndx] = (unsigned char)ndx;
+#elif defined TEST_MISSING
+		if (ndx >= 0x51)
+			pattern[ndx] = (unsigned char)ndx + 1;
+		else
+			pattern[ndx] = (unsigned char)ndx;
+#elif defined TEST_INSERTED
+		if (ndx == 0x51)
+			pattern[ndx] = ~(unsigned char)ndx;
+		else if (ndx >= 0x51)
+			pattern[ndx] = (unsigned char)ndx - 1;
+		else
+			pattern[ndx] = (unsigned char)ndx;
+#else
+		pattern[ndx] = (unsigned char)ndx;
+#endif
 	}
 
 	set_tty();
